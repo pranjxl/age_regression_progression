@@ -1,0 +1,82 @@
+# ======================
+# Datasets (never push)
+# ======================
+datasets/
+datasets/**
+
+# ======================
+# Environment
+# ======================
+myenv/
+venv/
+
+# ======================
+# Outputs
+# ======================
+output_images/
+debug_outputs/
+
+# ======================
+# Cache
+# ======================
+__pycache__/
+*.pyc
+*.pyo
+
+# ======================
+# IDE
+# ======================
+.vscode/
+
+# ======================
+# OS
+# ======================
+.DS_Store
+Thumbs.db
+
+# ======================
+# Training artifacts
+# ======================
+checkpoints/
+final_outputs/
+debug_outputs/
+output_images/
+
+# ======================
+# Input / test images
+# ======================
+input_images/
+*.png
+*.jpg
+*.jpeg
+
+# ======================
+# Datasets
+# ======================
+datasets/
+
+# ======================
+# Python cache
+# ======================
+__pycache__/
+*.pyc
+
+# ======================
+# Environments
+# ======================
+myenv/
+venv/
+
+# ======================
+# IDE / OS
+# ======================
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Model weights
+models/*.pt
+models/*.pth
+models/*.pkl
+models/*.caffemodel
+models/*.onnx
