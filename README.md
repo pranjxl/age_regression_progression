@@ -25,16 +25,27 @@ The project is built around a **StyleGAN2 FFHQ generator**, a **SAM (pSp-style) 
 ## 📂 Project Structure
 
 age_regression_progression/
+
 ├── train_adapter.py # Adapter training
+
 ├── inference_pipeline.py # Lightweight inference
+
 ├── test_reconstruct.py # High-quality reconstruction & refinement
+
 ├── utils.py # Model loading utilities
+
 ├── models/ # Pretrained model weights (not included)
+
 ├── checkpoints/ # Adapter checkpoints (ignored by git)
+
 ├── datasets/ # Training images (ignored by git)
+
 ├── input_images/ # Test inputs (ignored by git)
+
 ├── output_images/ # Generated outputs (ignored by git)
+
 └── README.md
+
 
 ---
 
