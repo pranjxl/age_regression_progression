@@ -182,6 +182,12 @@ def train(args):
     AGE_UNIT  = 20.0
     MAX_DELTA = 40.0
 
+    # Per-layer alpha weights (coarse→fine): computed once, reused every step
+    layer_weights = torch.ones(1, n_styles, 1, device=device, dtype=torch.float32)
+    layer_weights[:, :4,  :] = 1.0   # coarse: age/structure
+    layer_weights[:, 4:8, :] = 0.7   # mid: face shape
+    layer_weights[:, 8:,  :] = 0.3   # fine: texture/color
+
     step = 0
 
     if args.resume:
@@ -207,11 +213,12 @@ def train(args):
                     codes = sam_encode(sam, imgs, sam_ch, B, device)  # [B,18,512]
 
                 # ── Age delta + adapter ───────────────────────────────────────
-                delta_years = (torch.rand(B, device=device) * 2 - 1) * MAX_DELTA
-                alpha       = (delta_years / AGE_UNIT).view(-1, 1, 1)
+                delta_years   = (torch.rand(B, device=device) * 2 - 1) * MAX_DELTA
+                alpha         = (delta_years / AGE_UNIT).view(-1, 1, 1)
+                alpha_layered = alpha * layer_weights   # [B,18,1]
 
-                delta  = adapter(codes)                                # [B,18,512]
-                w_aged = (codes + alpha * delta).clamp(-5, 5)
+                delta  = adapter(codes)                 # [B,18,512]
+                w_aged = (codes + alpha_layered * delta).clamp(-5, 5)
 
                 # ── Generate aged image ───────────────────────────────────────
                 out_aged  = generator([w_aged], input_is_latent=True)
@@ -257,7 +264,7 @@ def train(args):
                 delta2      = adapter(w_reencoded)
                 if was_training:
                     adapter.train()
-                w_recovered = (w_reencoded + (-alpha) * delta2).clamp(-5, 5)
+                w_recovered = (w_reencoded + (-alpha_layered) * delta2).clamp(-5, 5)
                 cycle_loss  = F.mse_loss(w_recovered, codes)
 
                 # ── Manifold regularization ───────────────────────────────────
