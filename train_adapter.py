@@ -79,6 +79,15 @@ def preprocess_age(img):
     return (img - mean) / std
 
 
+def age_from_logits(out):
+    """Smooth differentiable age via softmax expectation over 101 bins.
+    Better gradient flow than using the post-processed scalar out[0]."""
+    logits = out[1] if isinstance(out, tuple) else out
+    probs  = torch.softmax(logits, dim=1)
+    ages   = torch.arange(0, 101, device=logits.device, dtype=torch.float32)
+    return (probs * ages).sum(dim=1)  # [B]
+
+
 def extract_codes(enc_out, batch_size, device):
     if isinstance(enc_out, (list, tuple)):
         codes = None
@@ -179,10 +188,9 @@ def train(args):
     L_MANIFOLD = 0.01
     L_DELTA    = 0.001
 
-    AGE_UNIT  = 20.0
-    MAX_DELTA = 40.0
+    AGE_UNIT = 20.0  # alpha = delta_years / AGE_UNIT → always ±1.0
 
-    # Per-layer alpha weights (coarse→fine): computed once, reused every step
+    # Per-layer alpha weights — computed once, reused every step
     layer_weights = torch.ones(1, n_styles, 1, device=device, dtype=torch.float32)
     layer_weights[:, :4,  :] = 1.0   # coarse: age/structure
     layer_weights[:, 4:8, :] = 0.7   # mid: face shape
@@ -205,45 +213,45 @@ def train(args):
             for imgs, _ in pbar:
                 step += 1
                 epoch_step += 1
-                imgs = imgs.to(device)          # [-1,1], shape [B,3,256,256]
+                imgs = imgs.to(device)
                 B    = imgs.shape[0]
 
                 # ── Encode ────────────────────────────────────────────────────
                 with torch.no_grad():
                     codes = sam_encode(sam, imgs, sam_ch, B, device)  # [B,18,512]
 
-                # ── Age delta + adapter ───────────────────────────────────────
-                delta_years   = (torch.rand(B, device=device) * 2 - 1) * MAX_DELTA
-                alpha         = (delta_years / AGE_UNIT).view(-1, 1, 1)
-                alpha_layered = alpha * layer_weights   # [B,18,1]
+                # ── Fixed ±20yr delta — consistent signal, stable gradients ──
+                signs         = torch.randint(0, 2, (B,), device=device) * 2 - 1
+                delta_years   = signs.float() * 20.0          # always ±20
+                alpha         = (delta_years / AGE_UNIT).view(-1, 1, 1)  # ±1.0
+                alpha_layered = alpha * layer_weights          # [B,18,1]
 
-                delta  = adapter(codes)                 # [B,18,512]
+                delta  = adapter(codes)                        # [B,18,512]
                 w_aged = (codes + alpha_layered * delta).clamp(-5, 5)
 
                 # ── Generate aged image ───────────────────────────────────────
                 out_aged  = generator([w_aged], input_is_latent=True)
                 imgs_aged = out_aged[0] if isinstance(out_aged, tuple) else out_aged
 
-                # Resize for various losses
                 imgs_aged_224 = F.interpolate(imgs_aged, size=224, mode="bilinear", align_corners=False)
                 imgs_256      = F.interpolate(imgs_aged, size=256, mode="bilinear", align_corners=False)
 
-                # ── Age loss (DEX expects ImageNet normalization) ──────────────
+                # ── Age loss — logits-based for smooth gradients ───────────────
                 with torch.no_grad():
-                    src_224      = F.interpolate(imgs, size=224, mode="bilinear", align_corners=False)
-                    src_224_norm = preprocess_age(src_224)
-                    orig_age_out = age_regressor(src_224_norm)
-                    orig_age     = orig_age_out[0] if isinstance(orig_age_out, tuple) else orig_age_out
-                    orig_age     = orig_age.squeeze(-1)              # [B]
+                    src_224  = F.interpolate(imgs, size=224, mode="bilinear", align_corners=False)
+                    orig_age = age_from_logits(age_regressor(preprocess_age(src_224)))
 
-                aged_224_norm = preprocess_age(imgs_aged_224)
-                pred_age_out  = age_regressor(aged_224_norm)
-                pred_age      = pred_age_out[0] if isinstance(pred_age_out, tuple) else pred_age_out
-                pred_age      = pred_age.squeeze(-1)                 # [B]
-                target_age    = (orig_age + delta_years).clamp(0, 100)
-                age_loss      = F.mse_loss(pred_age, target_age)
+                pred_age   = age_from_logits(age_regressor(preprocess_age(imgs_aged_224)))
+                target_age = (orig_age + delta_years).clamp(0, 100)
+                age_loss   = F.mse_loss(pred_age, target_age)
 
-                # ── Identity loss (IR-SE50 expects 112x112, [-1,1]) ───────────
+                # Debug print at step 1 to verify regressor
+                if epoch_step == 1:
+                    print(f"\n[DEBUG] orig_age={orig_age[:4].tolist()}")
+                    print(f"[DEBUG] pred_age={pred_age[:4].tolist()}")
+                    print(f"[DEBUG] target  ={target_age[:4].tolist()}")
+
+                # ── Identity loss ─────────────────────────────────────────────
                 imgs_112      = F.interpolate(imgs,      size=112, mode="bilinear", align_corners=False)
                 imgs_aged_112 = F.interpolate(imgs_aged, size=112, mode="bilinear", align_corners=False)
                 with torch.no_grad():
@@ -253,12 +261,10 @@ def train(args):
 
                 # ── Cycle loss ────────────────────────────────────────────────
                 with torch.no_grad():
-                    aged_norm     = imgs_aged.clamp(-1, 1)
-                    aged_256_norm = F.interpolate(aged_norm, size=256,
-                                                  mode="bilinear", align_corners=False)
-                    w_reencoded   = sam_encode(sam, aged_256_norm, sam_ch, B, device)
+                    aged_256 = F.interpolate(imgs_aged.clamp(-1, 1), size=256,
+                                             mode="bilinear", align_corners=False)
+                    w_reencoded = sam_encode(sam, aged_256, sam_ch, B, device)
 
-                # eval() disables dropout for stable cycle target, grad still flows
                 was_training = adapter.training
                 adapter.eval()
                 delta2      = adapter(w_reencoded)
@@ -268,18 +274,16 @@ def train(args):
                 cycle_loss  = F.mse_loss(w_recovered, codes)
 
                 # ── Manifold regularization ───────────────────────────────────
-                if w_mean is not None:
-                    manifold_loss = (w_aged - w_mean).pow(2).mean()
-                else:
-                    manifold_loss = torch.tensor(0.0, device=device)
+                manifold_loss = (w_aged - w_mean).pow(2).mean() if w_mean is not None \
+                                else torch.tensor(0.0, device=device)
 
                 # ── Delta regularization ──────────────────────────────────────
                 delta_reg = delta.pow(2).mean()
 
                 # ── LPIPS loss ────────────────────────────────────────────────
                 if lpips_fn is not None:
-                    imgs_01      = (imgs + 1) / 2
                     imgs_aged_01 = (imgs_256.clamp(-1, 1) + 1) / 2
+                    imgs_01      = (imgs + 1) / 2
                     lpips_loss   = lpips_fn(imgs_aged_01 * 2 - 1, imgs_01 * 2 - 1).mean()
                 else:
                     lpips_loss = torch.tensor(0.0, device=device)
@@ -310,7 +314,6 @@ def train(args):
                     cyc=f"{running['cycle']/n:.4f}",
                 )
 
-                # ── Sample images every 2000 steps ────────────────────────────
                 if epoch_step % 2000 == 0:
                     from torchvision.utils import save_image
                     save_image((imgs_aged.clamp(-1,1)+1)/2,
@@ -318,7 +321,6 @@ def train(args):
                     save_image((imgs.clamp(-1,1)+1)/2,
                                f"/kaggle/working/sample_src_ep{epoch+1}_step{epoch_step}.png", nrow=2)
 
-                # ── Mid-epoch checkpoint every 5000 steps ─────────────────────
                 if epoch_step % 5000 == 0:
                     mid_path = os.path.join(args.checkpoint_dir,
                                             f"adapter_ep{epoch+1}_step{epoch_step}.pt")
@@ -331,7 +333,6 @@ def train(args):
                     }, mid_path)
                     print(f"\n[INFO] Mid-epoch checkpoint -> {mid_path}")
 
-            # ── End of epoch checkpoint ───────────────────────────────────────
             ckpt_path = os.path.join(args.checkpoint_dir, f"adapter_epoch{epoch+1}.pt")
             torch.save({
                 "epoch":         epoch + 1,
