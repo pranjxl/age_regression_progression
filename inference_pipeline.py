@@ -15,41 +15,34 @@ def infer(args):
     print(f"[INFO] Using device: {device}")
 
     # Load models
-    sam, generator, age_regressor, _, _ = load_models(args.models_dir)
+    sam, generator, _, _, _ = load_models(args.models_dir)
     sam.to(device).eval()
     generator.to(device).eval()
-    age_regressor.to(device).eval()
 
     # Load trained adapter
     adapter = LatentAdapter(
         n_styles=getattr(generator, "n_latent", 18),
         style_dim=getattr(generator, "style_dim", 512)
     )
-
     ckpt = torch.load(args.adapter, map_location=device)
     adapter.load_state_dict(ckpt.get("adapter_state", ckpt))
     adapter.to(device).eval()
-
-    print(f"[DEBUG] Generator n_latent : {getattr(generator, 'n_latent', None)}")
-    print(f"[DEBUG] Generator style_dim: {getattr(generator, 'style_dim', None)}")
-    print(f"[DEBUG] Checkpoint keys    : {list(ckpt.keys())[:10]}")
+    print(f"[INFO] Adapter loaded from {args.adapter}")
 
     os.makedirs(args.output, exist_ok=True)
 
-    # Map mode to age delta
+    # Mode → alpha direction
+    # adapter was trained to predict SAM's age delta (older direction)
+    # so +delta = older, -delta = younger
     age_map = {
-        "reg--": -40,
-        "reg-":  -20,
-        "pro+":   20,
-        "pro++":  40
+        "pro": +1.0,   # older
+        "reg": -1.0,   # younger
     }
     if args.mode not in age_map:
-        raise ValueError(f"Unsupported mode: {args.mode}")
-    age_delta = age_map[args.mode]
+        raise ValueError(f"Unsupported mode: {args.mode}. Choose: reg, pro")
 
-    # Stronger alpha scaling: 20y = 1 unit
-    alpha = (age_delta / 20.0) * args.strength
-    print(f"[INFO] mode={args.mode} -> age_delta={age_delta}y, alpha={alpha:.3f}")
+    alpha = age_map[args.mode] * args.strength
+    print(f"[INFO] mode={args.mode} -> alpha={alpha:.3f}")
 
     # ── FFHQ alignment ────────────────────────────────────────────────────────
     print(f"[INFO] Aligning: {args.input}")
@@ -62,7 +55,7 @@ def infer(args):
         base_name_preview = os.path.splitext(os.path.basename(args.input))[0]
         preview_path = os.path.join(args.output, f"{base_name_preview}_aligned.png")
         img.save(preview_path)
-        print(f"[DEBUG] Aligned preview -> {preview_path}, size: {img.size}")
+        print(f"[INFO] Aligned preview saved -> {preview_path}")
 
     # ── Preprocessing ─────────────────────────────────────────────────────────
     preprocess = transforms.Compose([
@@ -77,7 +70,7 @@ def infer(args):
         sam_in_channels = sam.encoder.input_layer[0].in_channels
     except Exception:
         sam_in_channels = 3
-    print(f"[DEBUG] SAM input channels: {sam_in_channels}")
+    print(f"[INFO] SAM input channels: {sam_in_channels}")
 
     if sam_in_channels == 4:
         sam_in = torch.cat([inp, torch.zeros_like(inp[:, :1])], dim=1)
@@ -86,9 +79,8 @@ def infer(args):
 
     # ── Inference ─────────────────────────────────────────────────────────────
     with torch.no_grad():
+        # Encode
         enc_out = sam(sam_in, return_latents=True)
-        print(f"[DEBUG] enc_out type: {type(enc_out)}")
-
         if isinstance(enc_out, (list, tuple)):
             codes = None
             for item in enc_out[::-1]:
@@ -101,63 +93,43 @@ def infer(args):
                     codes = codes[0]
         else:
             codes = enc_out
-
         codes = codes.to(device)
-        print(f"[DEBUG] codes shape: {codes.shape}")
+        print(f"[DEBUG] codes shape: {codes.shape}, mean={codes.mean():.4f}")
 
-        # ── ADAPTER OUTPUT NOTE ───────────────────────────────────────────────
-        # This assumes adapter.forward() returns a DELTA (not full codes).
-        # If your adapter returns full codes, change to:
-        #   adapted = adapter(codes)
-        #   delta = adapted - codes
-        # Confirm by checking the last line of LatentAdapter.forward() in train_adapter.py
-        adapter_out = adapter(codes)
-        print(f"[DEBUG] adapter_out shape: {adapter_out.shape}")
-        print(f"[DEBUG] adapter_out mean={adapter_out.mean().item():.4f}  std={adapter_out.std().item():.4f}")
+        # Adapter predicts age delta (trained to match SAM's age direction)
+        delta = adapter(codes)
+        print(f"[DEBUG] delta norm={delta.norm():.4f}, mean={delta.mean():.4f}")
 
-        if adapter_out.shape == codes.shape:
-            # If values are close to zero -> adapter outputs delta directly
-            # If values are similar magnitude to codes -> adapter outputs full codes
-            is_delta = adapter_out.abs().mean().item() < codes.abs().mean().item() * 0.5
-            if is_delta:
-                print("[DEBUG] Adapter output looks like DELTA (small magnitude)")
-                delta = adapter_out
-            else:
-                print("[DEBUG] Adapter output looks like FULL CODES (large magnitude)")
-                delta = adapter_out - codes
-        else:
-            delta = adapter_out
-
+        # Apply edit: + for older, - for younger
         final_codes = codes + alpha * delta
-        final_codes = torch.clamp(final_codes, -10, 10)  # W+ safe range
+        final_codes = torch.clamp(final_codes, -5, 5)
+        print(f"[DEBUG] final_codes mean={final_codes.mean():.4f}")
 
-        print(f"[DEBUG] delta       mean={delta.mean().item():.4f}  std={delta.std().item():.4f}")
-        print(f"[DEBUG] final_codes mean={final_codes.mean().item():.4f}  std={final_codes.std().item():.4f}")
-
+        # Generate
         out = generator([final_codes], input_is_latent=True)
         img_gen = out[0] if isinstance(out, tuple) else out
         img_gen = (img_gen.clamp(-1, 1) + 1) / 2.0
 
     # ── Save ──────────────────────────────────────────────────────────────────
     out_img = (img_gen[0].permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
-
     base_name = os.path.splitext(os.path.basename(args.input))[0]
-    out_path = os.path.join(args.output, f"{base_name}_{args.mode}.png")
+    out_path  = os.path.join(args.output, f"{base_name}_{args.mode}_s{args.strength}.png")
     cv2.imwrite(out_path, cv2.cvtColor(out_img, cv2.COLOR_RGB2BGR))
     print(f"[DONE] Saved -> {out_path}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Age Progression Inference")
-
+    parser = argparse.ArgumentParser(description="Age Progression/Regression Inference")
     parser.add_argument("--models_dir", type=str, default="models")
-    parser.add_argument("--adapter",    type=str, required=True)
-    parser.add_argument("--input",      type=str, required=True)
+    parser.add_argument("--adapter",    type=str, required=True,
+                        help="Path to adapter checkpoint (.pt)")
+    parser.add_argument("--input",      type=str, required=True,
+                        help="Input image path")
     parser.add_argument("--output",     type=str, default="output_images")
     parser.add_argument("--mode",       type=str, required=True,
-                        choices=["reg--", "reg-", "pro+", "pro++"],
-                        help="reg-- (-40y)  reg- (-20y)  pro+ (+20y)  pro++ (+40y)")
-    parser.add_argument("--strength",   type=float, default=1.0)
-
+                        choices=["reg", "pro"],
+                        help="reg = younger, pro = older")
+    parser.add_argument("--strength",   type=float, default=1.0,
+                        help="Edit strength (default=1.0, try 0.5-2.0)")
     args = parser.parse_args()
     infer(args)
