@@ -1,4 +1,7 @@
 # train_adapter.py
+# Professional approach: train adapter using SAM-generated latent pairs
+# as direct supervision. No backprop through generator needed for main loss.
+
 import os
 import argparse
 from pathlib import Path
@@ -34,8 +37,6 @@ class ImageFolderDataset(Dataset):
         self.transform = transforms.Compose([
             transforms.Resize((size, size)),
             transforms.RandomHorizontalFlip(p=0.5),
-            transforms.ColorJitter(brightness=0.1, contrast=0.1,
-                                   saturation=0.05, hue=0.02),
             transforms.ToTensor(),
             transforms.Normalize([0.5] * 3, [0.5] * 3),
         ])
@@ -73,18 +74,19 @@ class LatentAdapter(nn.Module):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def preprocess_age(img):
     """Convert [-1,1] tensor to ImageNet normalization expected by DEX."""
-    img = (img + 1) / 2  # [-1,1] -> [0,1]
+    img = (img + 1) / 2
     mean = torch.tensor([0.485, 0.456, 0.406], device=img.device).view(1, 3, 1, 1)
     std  = torch.tensor([0.229, 0.224, 0.225], device=img.device).view(1, 3, 1, 1)
     return (img - mean) / std
 
 
 def age_from_logits(out):
-    """Smooth differentiable age via softmax expectation over 101 bins.
-    Better gradient flow than using the post-processed scalar out[0]."""
+    """Smooth differentiable age via softmax expectation over 101 bins."""
     logits = out[1] if isinstance(out, tuple) else out
-    probs  = torch.softmax(logits, dim=1)
-    ages   = torch.arange(0, 101, device=logits.device, dtype=torch.float32)
+    if logits.dim() == 1:
+        logits = logits.unsqueeze(0)
+    probs = torch.softmax(logits, dim=1)
+    ages  = torch.arange(0, 101, device=logits.device, dtype=torch.float32)
     return (probs * ages).sum(dim=1)  # [B]
 
 
@@ -110,6 +112,17 @@ def extract_codes(enc_out, batch_size, device):
 def sam_encode(sam, imgs, sam_ch, batch_size, device):
     if sam_ch == 4:
         sam_in = torch.cat([imgs, torch.zeros_like(imgs[:, :1])], dim=1)
+    else:
+        sam_in = imgs
+    enc_out = sam(sam_in, return_latents=True)
+    return extract_codes(enc_out, batch_size, device)
+
+
+def sam_encode_with_age(sam, imgs, sam_ch, batch_size, device, target_age_norm):
+    """SAM forward with age conditioning to get aged latents directly."""
+    if sam_ch == 4:
+        age_channel = torch.full_like(imgs[:, :1], target_age_norm)
+        sam_in = torch.cat([imgs, age_channel], dim=1)
     else:
         sam_in = imgs
     enc_out = sam(sam_in, return_latents=True)
@@ -173,31 +186,31 @@ def train(args):
             p.requires_grad_(False)
         print("[INFO] LPIPS enabled")
 
-    w_mean = w_std = None
-    if os.path.exists("w_mean.pt") and os.path.exists("w_std.pt"):
+    w_mean = None
+    if os.path.exists("w_mean.pt"):
         w_mean = torch.load("w_mean.pt", map_location=device)
-        w_std  = torch.load("w_std.pt",  map_location=device)
         print("[INFO] W+ manifold stats loaded")
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
-    L_AGE      = 1.0
-    L_ID       = 0.5
-    L_CYCLE    = 0.3
+    # ── Loss weights ──────────────────────────────────────────────────────────
+    # PRIMARY: direct latent supervision (no generator needed, strong signal)
+    L_LATENT   = 1.0   # MSE between predicted delta and SAM's actual delta
+    # SECONDARY: image-level losses (regularization)
+    L_ID       = 0.3
     L_LPIPS    = args.lpips_w
     L_MANIFOLD = 0.01
     L_DELTA    = 0.001
 
-    AGE_UNIT = 20.0  # alpha = delta_years / AGE_UNIT → always ±1.0
+    AGE_UNIT = 20.0
 
-    # Per-layer alpha weights — computed once, reused every step
+    # Per-layer alpha weights
     layer_weights = torch.ones(1, n_styles, 1, device=device, dtype=torch.float32)
-    layer_weights[:, :4,  :] = 1.0   # coarse: age/structure
-    layer_weights[:, 4:8, :] = 0.7   # mid: face shape
-    layer_weights[:, 8:,  :] = 0.3   # fine: texture/color
+    layer_weights[:, :4,  :] = 1.0
+    layer_weights[:, 4:8, :] = 0.7
+    layer_weights[:, 8:,  :] = 0.3
 
     step = 0
-
     if args.resume:
         _, step = resume_from_checkpoint(
             args.resume, adapter, opt, scheduler, device=device
@@ -207,7 +220,7 @@ def train(args):
         for epoch in range(args.epochs):
             adapter.train()
             pbar = tqdm(dl, desc=f"Epoch {epoch+1}/{args.epochs}")
-            running = {"total": 0, "age": 0, "id": 0, "cycle": 0}
+            running = {"total": 0, "latent": 0, "id": 0}
             epoch_step = 0
 
             for imgs, _ in pbar:
@@ -216,82 +229,85 @@ def train(args):
                 imgs = imgs.to(device)
                 B    = imgs.shape[0]
 
-                # ── Encode ────────────────────────────────────────────────────
                 with torch.no_grad():
-                    codes = sam_encode(sam, imgs, sam_ch, B, device)  # [B,18,512]
+                    # ── Encode source image ───────────────────────────────────
+                    codes_src = sam_encode(sam, imgs, sam_ch, B, device)
 
-                # ── Fixed ±20yr delta — consistent signal, stable gradients ──
-                signs         = torch.randint(0, 2, (B,), device=device) * 2 - 1
-                delta_years   = signs.float() * 20.0          # always ±20
-                alpha         = (delta_years / AGE_UNIT).view(-1, 1, 1)  # ±1.0
-                alpha_layered = alpha * layer_weights          # [B,18,1]
+                    # ── Get SAM's aged latents (±20 years) ───────────────────
+                    # SAM uses age channel in [0,1] where 0=young, 1=old
+                    # We request older version (0.75) and younger (0.25)
+                    signs = torch.randint(0, 2, (B,), device=device) * 2 - 1
+                    target_age_norm = torch.where(
+                        signs > 0,
+                        torch.full((B,), 0.75, device=device),  # older
+                        torch.full((B,), 0.25, device=device),  # younger
+                    )
+                    delta_years   = signs.float() * 20.0
+                    alpha         = (delta_years / AGE_UNIT).view(-1, 1, 1)
+                    alpha_layered = alpha * layer_weights
 
-                delta  = adapter(codes)                        # [B,18,512]
-                w_aged = (codes + alpha_layered * delta).clamp(-5, 5)
+                    # Get SAM's aged latents for each sample
+                    codes_aged_sam_list = []
+                    for i in range(B):
+                        age_ch = target_age_norm[i].item()
+                        w_sam  = sam_encode_with_age(
+                            sam, imgs[i:i+1], sam_ch, 1, device, age_ch
+                        )
+                        codes_aged_sam_list.append(w_sam)
+                    codes_aged_sam = torch.cat(codes_aged_sam_list, dim=0)  # [B,18,512]
 
-                # ── Generate aged image ───────────────────────────────────────
-                out_aged  = generator([w_aged], input_is_latent=True)
-                imgs_aged = out_aged[0] if isinstance(out_aged, tuple) else out_aged
+                    # ── Target delta: what SAM thinks the edit should be ──────
+                    target_delta = (codes_aged_sam - codes_src)  # [B,18,512]
+                    # Normalize direction: we want adapter to predict same direction
+                    # scaled by alpha_layered
+                    target_delta_normed = target_delta / (alpha_layered + 1e-8)
 
-                imgs_aged_224 = F.interpolate(imgs_aged, size=224, mode="bilinear", align_corners=False)
-                imgs_256      = F.interpolate(imgs_aged, size=256, mode="bilinear", align_corners=False)
+                # ── Adapter predicts delta ────────────────────────────────────
+                pred_delta = adapter(codes_src)  # [B,18,512]
 
-                # ── Age loss — logits-based for smooth gradients ───────────────
+                # PRIMARY LOSS: adapter delta should match SAM's delta direction
+                latent_loss = F.mse_loss(pred_delta, target_delta_normed.detach())
+
+                # Apply adapter edit
+                w_aged = (codes_src + alpha_layered * pred_delta).clamp(-5, 5)
+
+                # ── Image-level losses (secondary, regularization) ─────────────
                 with torch.no_grad():
-                    src_224  = F.interpolate(imgs, size=224, mode="bilinear", align_corners=False)
-                    orig_age = age_from_logits(age_regressor(preprocess_age(src_224)))
+                    out_aged  = generator([w_aged], input_is_latent=True)
+                    imgs_aged = out_aged[0] if isinstance(out_aged, tuple) else out_aged
+                    imgs_256  = F.interpolate(imgs_aged, size=256,
+                                              mode="bilinear", align_corners=False)
 
-                pred_age   = age_from_logits(age_regressor(preprocess_age(imgs_aged_224)))
-                target_age = (orig_age + delta_years).clamp(0, 100)
-                age_loss   = F.mse_loss(pred_age, target_age)
-
-                # Debug print at step 1 to verify regressor
-                if epoch_step == 1:
-                    print(f"\n[DEBUG] orig_age={orig_age[:4].tolist()}")
-                    print(f"[DEBUG] pred_age={pred_age[:4].tolist()}")
-                    print(f"[DEBUG] target  ={target_age[:4].tolist()}")
-
-                # ── Identity loss ─────────────────────────────────────────────
+                # Identity loss
                 imgs_112      = F.interpolate(imgs,      size=112, mode="bilinear", align_corners=False)
-                imgs_aged_112 = F.interpolate(imgs_aged, size=112, mode="bilinear", align_corners=False)
+                imgs_aged_112 = F.interpolate(imgs_aged.detach(), size=112,
+                                              mode="bilinear", align_corners=False)
                 with torch.no_grad():
                     feat_orig = id_model(imgs_112)
-                feat_aged = id_model(imgs_aged_112)
-                id_loss   = F.mse_loss(feat_orig, feat_aged)
+                    feat_aged = id_model(imgs_aged_112)
+                id_loss = F.mse_loss(feat_orig, feat_aged)
 
-                # ── Cycle loss ────────────────────────────────────────────────
-                with torch.no_grad():
-                    aged_256 = F.interpolate(imgs_aged.clamp(-1, 1), size=256,
-                                             mode="bilinear", align_corners=False)
-                    w_reencoded = sam_encode(sam, aged_256, sam_ch, B, device)
-
-                was_training = adapter.training
-                adapter.eval()
-                delta2      = adapter(w_reencoded)
-                if was_training:
-                    adapter.train()
-                w_recovered = (w_reencoded + (-alpha_layered) * delta2).clamp(-5, 5)
-                cycle_loss  = F.mse_loss(w_recovered, codes)
-
-                # ── Manifold regularization ───────────────────────────────────
+                # Manifold regularization
                 manifold_loss = (w_aged - w_mean).pow(2).mean() if w_mean is not None \
                                 else torch.tensor(0.0, device=device)
 
-                # ── Delta regularization ──────────────────────────────────────
-                delta_reg = delta.pow(2).mean()
+                # Delta regularization
+                delta_reg = pred_delta.pow(2).mean()
 
-                # ── LPIPS loss ────────────────────────────────────────────────
+                # LPIPS (optional)
                 if lpips_fn is not None:
-                    imgs_aged_01 = (imgs_256.clamp(-1, 1) + 1) / 2
-                    imgs_01      = (imgs + 1) / 2
-                    lpips_loss   = lpips_fn(imgs_aged_01 * 2 - 1, imgs_01 * 2 - 1).mean()
+                    imgs_aged_256 = F.interpolate(imgs_aged.detach(), size=256,
+                                                  mode="bilinear", align_corners=False)
+                    lpips_loss = lpips_fn(
+                        imgs_aged_256.clamp(-1,1),
+                        F.interpolate(imgs, size=256, mode="bilinear", align_corners=False)
+                    ).mean()
                 else:
                     lpips_loss = torch.tensor(0.0, device=device)
 
                 # ── Total loss ────────────────────────────────────────────────
-                loss = (L_AGE      * age_loss
+                loss = (L_LATENT   * latent_loss
                       + L_ID       * id_loss
-                      + L_CYCLE    * cycle_loss
                       + L_MANIFOLD * manifold_loss
                       + L_DELTA    * delta_reg
                       + L_LPIPS    * lpips_loss)
@@ -302,17 +318,20 @@ def train(args):
                 opt.step()
                 scheduler.step()
 
-                running["total"] += loss.item()
-                running["age"]   += age_loss.item()
-                running["id"]    += id_loss.item()
-                running["cycle"] += cycle_loss.item()
+                running["total"]  += loss.item()
+                running["latent"] += latent_loss.item()
+                running["id"]     += id_loss.item()
                 n = epoch_step
                 pbar.set_postfix(
                     loss=f"{running['total']/n:.4f}",
-                    age=f"{running['age']/n:.4f}",
+                    lat=f"{running['latent']/n:.4f}",
                     id=f"{running['id']/n:.4f}",
-                    cyc=f"{running['cycle']/n:.4f}",
                 )
+
+                if epoch_step == 1:
+                    print(f"\n[DEBUG] target_delta norm={target_delta.norm(dim=-1).mean():.4f}")
+                    print(f"[DEBUG] pred_delta   norm={pred_delta.norm(dim=-1).mean():.4f}")
+                    print(f"[DEBUG] latent_loss={latent_loss.item():.4f}")
 
                 if epoch_step % 2000 == 0:
                     from torchvision.utils import save_image
@@ -369,9 +388,7 @@ if __name__ == "__main__":
     parser.add_argument("--hidden",         type=int,   default=1024)
     parser.add_argument("--use_lpips",      action="store_true")
     parser.add_argument("--lpips_w",        type=float, default=0.1)
-    parser.add_argument("--resume",         type=str,   default=None,
-                        help="Path to checkpoint to resume from")
-    parser.add_argument("--max_images",     type=int,   default=None,
-                        help="Limit dataset size e.g. 5000 for quick sanity run")
+    parser.add_argument("--resume",         type=str,   default=None)
+    parser.add_argument("--max_images",     type=int,   default=None)
     args = parser.parse_args()
     train(args)
