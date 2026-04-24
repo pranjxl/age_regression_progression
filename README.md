@@ -28,24 +28,6 @@ The system takes a real face image, encodes it into StyleGAN2 latent space, appl
 
 ---
 
-## 🖼️ Example Results
-
-<p align="center">
-  <img src="assets/example1.png" width="900" />
-</p>
-
-<p align="center">
-  <img src="assets/example2.png" width="900" />
-</p>
-
-<p align="center">
-  <img src="assets/example3.png" width="900" />
-</p>
-
-> The model performs semantic age shifts while keeping the face recognizably the same person.
-
----
-
 ## 🧱 System Architecture
 
 ```text
