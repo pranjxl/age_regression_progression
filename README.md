@@ -3,7 +3,7 @@
 A deep learning system for **identity-preserving facial age transformation** using StyleGAN2 latent-space editing and a custom-trained latent adapter.
 
 <p align="center">
-  <img src="assets/results.png" width="900" />
+  <img src="checkpoints\checkpoint_outputs/results.png" width="900" />
 </p>
 
 ---
