@@ -32,8 +32,6 @@ def infer(args):
     os.makedirs(args.output, exist_ok=True)
 
     # Mode → alpha direction
-    # adapter was trained to predict SAM's age delta (older direction)
-    # so +delta = older, -delta = younger
     age_map = {
         "pro": +1.0,   # older
         "reg": -1.0,   # younger
@@ -42,20 +40,28 @@ def infer(args):
         raise ValueError(f"Unsupported mode: {args.mode}. Choose: reg, pro")
 
     alpha = age_map[args.mode] * args.strength
-    print(f"[INFO] mode={args.mode} -> alpha={alpha:.3f}")
+    print(f"[INFO] mode={args.mode} -> alpha={alpha:.3f}, preserve_id={args.preserve_id}")
 
     # ── FFHQ alignment ────────────────────────────────────────────────────────
-    print(f"[INFO] Aligning: {args.input}")
-    img = align_face(args.input, output_size=256)
+    base_name_preview = os.path.splitext(os.path.basename(args.input))[0]
 
-    if img is None:
-        print("[WARN] No face detected — falling back to unaligned image")
+    if args.no_align:
+        # Input is already FFHQ-aligned — skip to prevent double-crop distortion
+        print(f"[INFO] Skipping alignment (--no_align): {args.input}")
         img = Image.open(args.input).convert("RGB")
-    else:
-        base_name_preview = os.path.splitext(os.path.basename(args.input))[0]
-        preview_path = os.path.join(args.output, f"{base_name_preview}_aligned.png")
+        preview_path = os.path.join(args.output, f"{base_name_preview}_input.png")
         img.save(preview_path)
-        print(f"[INFO] Aligned preview saved -> {preview_path}")
+        print(f"[INFO] Input preview saved -> {preview_path}")
+    else:
+        print(f"[INFO] Aligning: {args.input}")
+        img = align_face(args.input, output_size=256)
+        if img is None:
+            print("[WARN] No face detected — falling back to unaligned image")
+            img = Image.open(args.input).convert("RGB")
+        else:
+            preview_path = os.path.join(args.output, f"{base_name_preview}_aligned.png")
+            img.save(preview_path)
+            print(f"[INFO] Aligned preview saved -> {preview_path}")
 
     # ── Preprocessing ─────────────────────────────────────────────────────────
     preprocess = transforms.Compose([
@@ -73,7 +79,13 @@ def infer(args):
     print(f"[INFO] SAM input channels: {sam_in_channels}")
 
     if sam_in_channels == 4:
-        sam_in = torch.cat([inp, torch.zeros_like(inp[:, :1])], dim=1)
+        # 4th channel = current age of input photo, normalized to [0,1]
+        # 0.0 = newborn, 1.0 = 100 years old
+        # e.g. 30-year-old → 0.30, 50-year-old → 0.50
+        age_norm = args.source_age / 100.0
+        age_map  = torch.ones_like(inp[:, :1]) * age_norm
+        sam_in   = torch.cat([inp, age_map], dim=1)
+        print(f"[INFO] SAM age channel set to {age_norm:.2f} ({args.source_age}y)")
     else:
         sam_in = inp
 
@@ -94,14 +106,35 @@ def infer(args):
         else:
             codes = enc_out
         codes = codes.to(device)
+        n_styles = codes.shape[1]
         print(f"[DEBUG] codes shape: {codes.shape}, mean={codes.mean():.4f}")
 
-        # Adapter predicts age delta (trained to match SAM's age direction)
+        # Adapter predicts age delta
         delta = adapter(codes)
         print(f"[DEBUG] delta norm={delta.norm():.4f}, mean={delta.mean():.4f}")
 
-        # Apply edit: + for older, - for younger
-        final_codes = codes + alpha * delta
+        # ── Safety clamp for frozen generator ─────────────────────────────
+        # SAM was trained with PTI (per-image generator fine-tuning) which
+        # allows large deltas (norm ~28). Our frozen generator cannot survive
+        # that magnitude — it explodes the latent space.
+        # We scale delta down to a safe per-layer norm before applying.
+        per_layer_norm = delta.norm(dim=-1, keepdim=True)          # [1,18,1]
+        safe_norm      = per_layer_norm.clamp(max=args.delta_max)  # cap per layer
+        delta          = delta * (safe_norm / (per_layer_norm + 1e-8))
+        print(f"[DEBUG] delta norm after clamp={delta.norm():.4f}")
+
+        # ── Layer mixing for identity preservation ─────────────────────────
+        # preserve_id=0.0 → edit all layers equally (max age change, max squish)
+        # preserve_id=1.0 → protect coarse layers (bones/structure), edit fine layers (skin/texture)
+        # Coarse layers (0-3)  → bone structure, jaw, skull → PROTECT when preserve_id is high
+        # Mid layers   (4-7)  → face shape                 → partially protect
+        # Fine layers  (8-17) → skin, wrinkles, texture    → always edit (safe, no squish)
+        layer_mask = torch.ones_like(codes)
+        layer_mask[:, :4,  :] = 1.0 - args.preserve_id        # coarse: protect bones
+        layer_mask[:, 4:8, :] = 1.0 - args.preserve_id * 0.5  # mid: partial protection
+        layer_mask[:, 8:,  :] = 1.0                            # fine: always edit skin
+
+        final_codes = codes + alpha * delta * layer_mask
         final_codes = torch.clamp(final_codes, -5, 5)
         print(f"[DEBUG] final_codes mean={final_codes.mean():.4f}")
 
@@ -113,23 +146,36 @@ def infer(args):
     # ── Save ──────────────────────────────────────────────────────────────────
     out_img = (img_gen[0].permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
     base_name = os.path.splitext(os.path.basename(args.input))[0]
-    out_path  = os.path.join(args.output, f"{base_name}_{args.mode}_s{args.strength}.png")
+    out_path  = os.path.join(
+        args.output,
+        f"{base_name}_{args.mode}_s{args.strength}_id{args.preserve_id}.png"
+    )
     cv2.imwrite(out_path, cv2.cvtColor(out_img, cv2.COLOR_RGB2BGR))
     print(f"[DONE] Saved -> {out_path}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Age Progression/Regression Inference")
-    parser.add_argument("--models_dir", type=str, default="models")
-    parser.add_argument("--adapter",    type=str, required=True,
+    parser.add_argument("--models_dir",  type=str,   default="models")
+    parser.add_argument("--adapter",     type=str,   required=True,
                         help="Path to adapter checkpoint (.pt)")
-    parser.add_argument("--input",      type=str, required=True,
+    parser.add_argument("--input",       type=str,   required=True,
                         help="Input image path")
-    parser.add_argument("--output",     type=str, default="output_images")
-    parser.add_argument("--mode",       type=str, required=True,
+    parser.add_argument("--output",      type=str,   default="output_images")
+    parser.add_argument("--mode",        type=str,   required=True,
                         choices=["reg", "pro"],
                         help="reg = younger, pro = older")
-    parser.add_argument("--strength",   type=float, default=1.0,
+    parser.add_argument("--source_age",  type=float, default=30.0,
+                        help="Estimated age of person in input photo (default=30)")
+    parser.add_argument("--strength",    type=float, default=1.0,
                         help="Edit strength (default=1.0, try 0.5-2.0)")
+    parser.add_argument("--preserve_id", type=float, default=0.0,
+                        help="Identity preservation 0.0=off 1.0=max (protects bone structure)")
+    parser.add_argument("--delta_max",   type=float, default=3.0,
+                        help="Max per-layer delta norm (default=3.0, safe for frozen generator)")
+    parser.add_argument("--no_align",    action="store_true",
+                        help="Skip FFHQ alignment (use if input is already cropped perfectly)")
+    
     args = parser.parse_args()
     infer(args)
+    
