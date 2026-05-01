@@ -70,6 +70,7 @@ def align_face(image_path, output_size=256):
                        dtype=np.float32)
 
         # FFHQ canonical target positions (normalised to output_size)
+        # FFHQ canonical target positions (normalised to output_size)
         dst = np.array([
             [0.31 * output_size, 0.35 * output_size],  # left eye
             [0.69 * output_size, 0.35 * output_size],  # right eye
@@ -77,6 +78,15 @@ def align_face(image_path, output_size=256):
             [0.35 * output_size, 0.75 * output_size],  # left mouth
             [0.65 * output_size, 0.75 * output_size],  # right mouth
         ], dtype=np.float32)
+
+        # ── THE ZOOM FIX ───────────────────────────────────────────────
+        # Shrink the destination footprint to pull in more background pixels.
+        # 1.0 = Default (tight crop). 
+        # 0.7 = Zoomed out (captures hair, ears, and jaw).
+        zoom_factor = 0.75 
+        center = np.array([0.5 * output_size, 0.5 * output_size], dtype=np.float32)
+        dst = center + (dst - center) * zoom_factor
+        # ───────────────────────────────────────────────────────────────
 
         T = _umeyama(src, dst, estimate_scale=True)
         M = T[:2]  # 2x3 affine matrix
